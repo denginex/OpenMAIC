@@ -5,7 +5,7 @@
  */
 
 import { generateText, streamText } from 'ai';
-import type { GenerateTextResult, StreamTextResult } from 'ai';
+import type { GenerateTextResult, JSONValue, LanguageModel, StreamTextResult } from 'ai';
 import { createLogger } from '@/lib/logger';
 import { PROVIDERS } from './providers';
 import { thinkingContext } from './thinking-context';
@@ -102,7 +102,7 @@ function getGlobalThinkingConfig(): ThinkingConfig | undefined {
   return undefined;
 }
 
-type ProviderOptions = Record<string, Record<string, unknown>>;
+type ProviderOptions = Record<string, Record<string, JSONValue | undefined>>;
 
 function getAnthropicEffort(
   thinking: ThinkingCapability,
@@ -113,14 +113,23 @@ function getAnthropicEffort(
   return effort;
 }
 
+function normalizeProviderId(
+  provider: string | undefined,
+  modelId: string | undefined,
+): string | undefined {
+  if (!provider) return undefined;
+  if (provider === 'anthropic.messages' && modelId?.startsWith('MiniMax-')) return 'minimax';
+  if (provider in PROVIDERS) return provider;
+  const prefix = provider.split('.')[0];
+  return prefix in PROVIDERS ? prefix : undefined;
+}
+
 function getModelProviderId(params: GenerateTextParams | StreamTextParams): string | undefined {
   const m = params.model;
   if (!m || typeof m !== 'object' || !('provider' in m)) return undefined;
   const provider = (m as { provider?: string }).provider;
-  if (!provider) return undefined;
-  if (provider in PROVIDERS) return provider;
-  const prefix = provider.split('.')[0];
-  return prefix in PROVIDERS ? prefix : undefined;
+  const modelId = 'modelId' in m ? (m as { modelId?: string }).modelId : undefined;
+  return normalizeProviderId(provider, modelId);
 }
 
 /**
@@ -147,36 +156,41 @@ function buildThinkingProviderOptions(
     }
 
     case 'anthropic': {
-      if (mode === 'disabled') return { anthropic: { thinking: { type: 'disabled' } } };
+      const buildAnthropicOptions = (
+        options: Record<string, JSONValue | undefined>,
+      ): ProviderOptions => ({
+        anthropic: options,
+      });
+
+      if (mode === 'disabled') return buildAnthropicOptions({ thinking: { type: 'disabled' } });
 
       if (thinking.control === 'toggle-budget' || thinking.control === 'budget-only') {
         const budget = pickThinkingBudget(thinking, config);
         return budget === undefined
           ? undefined
-          : { anthropic: { thinking: { type: 'enabled', budgetTokens: budget } } };
+          : buildAnthropicOptions({ thinking: { type: 'enabled', budgetTokens: budget } });
       }
 
       const effort = getAnthropicEffort(thinking, config);
       if (!effort) return undefined;
 
       if (thinking.anthropicThinking?.type === 'adaptive') {
-        return {
-          anthropic: {
-            thinking: { type: 'adaptive' },
-            effort,
-          },
-        };
+        // Some newly released Anthropic effort values can lag the local SDK
+        // schema. OpenAI-compatible transports still inject those at fetch time.
+        if (effort === 'xhigh') return undefined;
+        return buildAnthropicOptions({
+          thinking: { type: 'adaptive' },
+          effort,
+        });
       }
 
       const manualEffort = effort === 'xhigh' ? 'max' : effort;
       const budget = thinking.anthropicThinking?.budgetByEffort?.[manualEffort];
       if (!budget) return undefined;
-      return {
-        anthropic: {
-          thinking: { type: 'enabled', budgetTokens: budget },
-          effort: manualEffort,
-        },
-      };
+      return buildAnthropicOptions({
+        thinking: { type: 'enabled', budgetTokens: budget },
+        effort: manualEffort,
+      });
     }
 
     case 'google': {
@@ -194,6 +208,24 @@ function buildThinkingProviderOptions(
       // OpenAI-compatible providers are injected in providers.ts fetch wrapper.
       return undefined;
   }
+}
+
+/**
+ * Resolve providerOptions for direct AI SDK calls that bypass callLLM/streamLLM.
+ */
+export function resolveThinkingProviderOptions(
+  model: LanguageModel,
+  thinkingConfig?: ThinkingConfig,
+): ProviderOptions | undefined {
+  if (!thinkingConfig) return undefined;
+  if (typeof model !== 'object' || !('modelId' in model)) return undefined;
+  const modelId = (model as { modelId?: string }).modelId ?? 'unknown';
+  const provider = 'provider' in model ? (model as { provider?: string }).provider : undefined;
+  return buildThinkingProviderOptions(
+    normalizeProviderId(provider, modelId),
+    modelId,
+    thinkingConfig,
+  );
 }
 
 /**
@@ -235,6 +267,44 @@ export interface LLMRetryOptions {
 }
 
 const DEFAULT_VALIDATE = (text: string) => text.trim().length > 0;
+
+// ---------------------------------------------------------------------------
+// Usage capture
+//
+// Every server-side LLM call funnels through callLLM/streamLLM, so usage is
+// recorded here in one place. Fire-and-forget: failures never affect generation.
+// The fs-backed storage is imported dynamically so llm.ts stays safe to bundle
+// wherever it's transitively imported.
+// ---------------------------------------------------------------------------
+
+function buildUsageMeta(params: GenerateTextParams | StreamTextParams, source: string) {
+  const modelId = getModelId(params);
+  const providerId = getModelProviderId(params) ?? 'unknown';
+  return { source, providerId, modelId, modelString: `${providerId}:${modelId}` };
+}
+
+/** Record one call's usage. Never throws. */
+function recordUsageSafe(
+  rawUsage: unknown,
+  meta: { source: string; providerId: string; modelId: string; modelString: string },
+): void {
+  void (async () => {
+    try {
+      const { normalizeUsage } = await import('@/lib/usage/normalize');
+      const { recordUsage } = await import('@/lib/server/usage-storage');
+      await recordUsage({
+        kind: 'llm',
+        source: meta.source,
+        providerId: meta.providerId,
+        modelId: meta.modelId,
+        modelString: meta.modelString,
+        usage: normalizeUsage(rawUsage as never),
+      });
+    } catch (err) {
+      log.warn('Usage capture failed (ignored):', err);
+    }
+  })();
+}
 
 /**
  * Unified wrapper around `generateText`.
@@ -280,6 +350,7 @@ export async function callLLM<T extends GenerateTextParams>(
         continue;
       }
 
+      recordUsageSafe(result.usage, buildUsageMeta(params, source));
       return result;
     } catch (error) {
       lastError = error;
@@ -313,7 +384,22 @@ export function streamLLM<T extends StreamTextParams>(
 ): StreamTextResult<any, any> {
   // Resolve effective thinking config and wrap in thinkingContext
   const effectiveThinking = thinking ?? getGlobalThinkingConfig();
-  const injectedParams = injectProviderOptions(params, effectiveThinking);
+
+  // Wrap onFinish to capture usage when the stream completes, preserving any
+  // caller-supplied onFinish. totalUsage aggregates across steps.
+  const usageMeta = buildUsageMeta(params, source);
+  const callerOnFinish = (params as Record<string, unknown>).onFinish as
+    | ((event: { totalUsage?: unknown; usage?: unknown }) => void | Promise<void>)
+    | undefined;
+  const wrappedParams = {
+    ...params,
+    onFinish: async (event: { totalUsage?: unknown; usage?: unknown }) => {
+      recordUsageSafe(event.totalUsage ?? event.usage, usageMeta);
+      if (callerOnFinish) await callerOnFinish(event);
+    },
+  } as T;
+
+  const injectedParams = injectProviderOptions(wrappedParams, effectiveThinking);
   const result = thinkingContext.run(effectiveThinking, () => streamText(injectedParams));
 
   return result;

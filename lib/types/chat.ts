@@ -10,7 +10,7 @@ import type { ThinkingConfig } from './provider';
 
 // Session Types
 export type SessionType = 'qa' | 'discussion' | 'lecture';
-export type SessionStatus = 'idle' | 'active' | 'interrupted' | 'completed';
+export type SessionStatus = 'idle' | 'active' | 'interrupted' | 'completed' | 'error';
 
 /**
  * Metadata attached to chat messages
@@ -59,8 +59,6 @@ export interface ChatSession {
  */
 export interface SessionConfig {
   agentIds: string[];
-  maxTurns: number;
-  currentTurn: number;
   triggerAgentId?: string; // For discussion: first agent to speak
   defaultAgentId?: string; // For QA: the responding agent
 }
@@ -137,7 +135,6 @@ export interface CreateSessionRequest {
     message?: string;
     agentIds: string[];
     triggerAgentId?: string;
-    maxTurns?: number;
   };
 }
 
@@ -244,6 +241,25 @@ export interface StatelessChatRequest {
     currentSceneId: string | null;
     mode: StageMode;
     whiteboardOpen: boolean;
+    /**
+     * Post-submit quiz state for the CURRENT scene, hydrated by the client
+     * from localStorage when the active scene is a graded quiz. Lets the
+     * agent give targeted feedback on the student's actual answers
+     * (correct/incorrect, written response, AI grader comment) instead of
+     * guessing. Absent when the student has not submitted yet, or when the
+     * active scene is not a quiz.
+     */
+    quizResults?: {
+      sceneId: string;
+      answers: Record<string, string | string[]>;
+      results: Array<{
+        questionId: string;
+        correct: boolean | null;
+        status: 'correct' | 'incorrect';
+        earned: number;
+        aiComment?: string;
+      }>;
+    };
   };
   /** Agent configuration */
   config: {

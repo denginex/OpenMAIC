@@ -7,7 +7,8 @@
  *
  * The loop runs per-user-message: the director dispatches agents one at a
  * time, each agent generates a response, and the loop continues until the
- * director says END, cues the user, or maxTurns is reached.
+ * director says END, cues the user, or two consecutive empty agent turns
+ * indicate something is wrong.
  */
 
 import type { StatelessEvent, DirectorState } from '@/lib/types/chat';
@@ -25,6 +26,22 @@ export interface AgentLoopStoreState {
   currentSceneId: string | null;
   mode: string;
   whiteboardOpen: boolean;
+  /**
+   * Post-submit quiz state for the current scene. Hydrated from localStorage
+   * client-side; absent when the active scene is not a graded quiz or the
+   * student has not submitted yet.
+   */
+  quizResults?: {
+    sceneId: string;
+    answers: Record<string, string | string[]>;
+    results: Array<{
+      questionId: string;
+      correct: boolean | null;
+      status: 'correct' | 'incorrect';
+      earned: number;
+      aiComment?: string;
+    }>;
+  };
 }
 
 /** Request template — fields that stay constant across loop iterations */
@@ -87,7 +104,7 @@ export interface AgentLoopCallbacks {
 /** Final outcome of the agent loop */
 export interface AgentLoopOutcome {
   /** Why the loop stopped */
-  reason: 'end' | 'cue_user' | 'max_turns' | 'aborted' | 'empty_turns' | 'no_done';
+  reason: 'end' | 'cue_user' | 'aborted' | 'empty_turns' | 'no_done';
   /** Accumulated director state */
   directorState?: DirectorState;
   /** Number of iterations completed */
@@ -100,19 +117,21 @@ export interface AgentLoopOutcome {
  * Run the agent loop — shared between frontend and eval.
  *
  * Each iteration: refresh state → POST /api/chat → process SSE events
- * → check exit conditions → repeat.
+ * → check exit conditions → repeat until director cues USER, ENDs, the
+ * stream errors out, or two consecutive empty agent turns are observed.
+ * There is no client-side max-turn cap; the LLM director controls
+ * round length via cue_user / END.
  */
 export async function runAgentLoop(
   request: AgentLoopRequest,
   callbacks: AgentLoopCallbacks,
   signal: AbortSignal,
-  maxTurns: number,
 ): Promise<AgentLoopOutcome> {
   let directorState: DirectorState | undefined = undefined;
   let turnCount = 0;
   let consecutiveEmptyTurns = 0;
 
-  while (turnCount < maxTurns) {
+  while (true) {
     if (signal.aborted) {
       return { reason: 'aborted', directorState, turnCount };
     }
@@ -215,10 +234,4 @@ export async function runAgentLoop(
       consecutiveEmptyTurns = 0;
     }
   }
-
-  // maxTurns reached
-  if (turnCount >= maxTurns) {
-    log.info(`[AgentLoop] Max turns (${maxTurns}) reached`);
-  }
-  return { reason: 'max_turns', directorState, turnCount };
 }
